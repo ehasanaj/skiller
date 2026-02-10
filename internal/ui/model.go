@@ -360,7 +360,7 @@ func (m *Model) renderRegistriesPane(width, height int) string {
 		}
 	}
 
-	return paneBoxStyle(width, height).Render(strings.Join(lines, "\n"))
+	return paneBoxStyle(width, height, m.focus == focusRegistries).Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) renderSkillsPane(width, height int) string {
@@ -370,7 +370,7 @@ func (m *Model) renderSkillsPane(width, height int) string {
 	registry := m.selectedRegistryPath()
 	if registry == "" {
 		lines = append(lines, mutedStyle.Render("Select a registry to view skills."))
-		return paneBoxStyle(width, height).Render(strings.Join(lines, "\n"))
+		return paneBoxStyle(width, height, m.focus == focusSkills).Render(strings.Join(lines, "\n"))
 	}
 
 	skills := m.registrySkills[registry]
@@ -390,7 +390,7 @@ func (m *Model) renderSkillsPane(width, height int) string {
 		}
 	}
 
-	return paneBoxStyle(width, height).Render(strings.Join(lines, "\n"))
+	return paneBoxStyle(width, height, m.focus == focusSkills).Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) renderHarnessPane(width, height int) string {
@@ -399,7 +399,7 @@ func (m *Model) renderHarnessPane(width, height int) string {
 
 	if len(m.harnessRows) == 0 {
 		lines = append(lines, mutedStyle.Render("No harness paths. Press a to add."))
-		return paneBoxStyle(width, height).Render(strings.Join(lines, "\n"))
+		return paneBoxStyle(width, height, m.focus == focusHarnesses).Render(strings.Join(lines, "\n"))
 	}
 
 	for i, row := range m.harnessRows {
@@ -419,7 +419,7 @@ func (m *Model) renderHarnessPane(width, height int) string {
 		lines = append(lines, truncate(line, width-2))
 	}
 
-	return paneBoxStyle(width, height).Render(strings.Join(lines, "\n"))
+	return paneBoxStyle(width, height, m.focus == focusHarnesses).Render(strings.Join(lines, "\n"))
 }
 
 func (m *Model) renderFooter(width int) string {
@@ -784,7 +784,7 @@ var (
 
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
+	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("31"))
 
 	helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
 
@@ -798,11 +798,15 @@ var (
 func paneTitleStyle(active bool) lipgloss.Style {
 	style := lipgloss.NewStyle().Bold(true)
 	if active {
-		return style.Foreground(lipgloss.Color("230"))
+		return style.Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Padding(0, 1)
 	}
 	return style.Foreground(lipgloss.Color("250"))
 }
 
-func paneBoxStyle(width, height int) lipgloss.Style {
-	return lipgloss.NewStyle().Border(paneBorder).Padding(0, 1).Width(width).Height(height)
+func paneBoxStyle(width, height int, active bool) lipgloss.Style {
+	style := lipgloss.NewStyle().Border(paneBorder).Padding(0, 1).Width(width).Height(height)
+	if active {
+		return style.BorderForeground(lipgloss.Color("45"))
+	}
+	return style.BorderForeground(lipgloss.Color("238"))
 }
