@@ -1,9 +1,13 @@
 package config
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -20,7 +24,53 @@ var knownHarnessCandidates = []string{
 	"~/.agents/skills",
 }
 
+type RegistryType string
+
+const (
+	RegistryTypeLocal RegistryType = "local"
+	RegistryTypeGit   RegistryType = "git"
+)
+
+type Registry struct {
+	ID     string       `toml:"id,omitempty"`
+	Name   string       `toml:"name,omitempty"`
+	Type   RegistryType `toml:"type"`
+	Source string       `toml:"source"`
+	Ref    string       `toml:"ref,omitempty"`
+	Subdir string       `toml:"subdir,omitempty"`
+}
+
+func (r Registry) IsRemote() bool {
+	return r.Type == RegistryTypeGit
+}
+
+func (r Registry) DisplayName() string {
+	if strings.TrimSpace(r.Name) != "" {
+		return strings.TrimSpace(r.Name)
+	}
+	if r.Type == RegistryTypeGit {
+		trimmed := strings.TrimSuffix(strings.TrimSpace(r.Source), ".git")
+		if idx := strings.LastIndex(trimmed, "/"); idx >= 0 && idx < len(trimmed)-1 {
+			return trimmed[idx+1:]
+		}
+		if idx := strings.LastIndex(trimmed, ":"); idx >= 0 && idx < len(trimmed)-1 {
+			return trimmed[idx+1:]
+		}
+	}
+	return strings.TrimSpace(r.Source)
+}
+
 type Config struct {
+	Registries []Registry `toml:"registries"`
+	Harnesses  []string   `toml:"harnesses"`
+}
+
+type configV2 struct {
+	Registries []Registry `toml:"registries"`
+	Harnesses  []string   `toml:"harnesses"`
+}
+
+type legacyConfigV1 struct {
 	Registries []string `toml:"registries"`
 	Harnesses  []string `toml:"harnesses"`
 }
@@ -31,21 +81,23 @@ func Load() (*Config, string, error) {
 		return nil, "", err
 	}
 
-	cfg := &Config{}
 	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
-		return cfg, configPath, nil
+		return &Config{}, configPath, nil
 	} else if err != nil {
 		return nil, "", err
 	}
 
-	if _, err := toml.DecodeFile(configPath, cfg); err != nil {
-		return nil, "", err
+	loadedV2, v2Err := loadV2(configPath)
+	if v2Err == nil {
+		return loadedV2, configPath, nil
 	}
 
-	cfg.Registries = normalizePaths(cfg.Registries)
-	cfg.Harnesses = normalizePaths(cfg.Harnesses)
+	loadedV1, v1Err := loadLegacyV1(configPath)
+	if v1Err == nil {
+		return loadedV1, configPath, nil
+	}
 
-	return cfg, configPath, nil
+	return nil, "", v2Err
 }
 
 func ConfigPath() (string, error) {
@@ -54,6 +106,33 @@ func ConfigPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, AppName, ConfigFileName), nil
+}
+
+func CacheRoot() (string, error) {
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); xdg != "" {
+		return ExpandPath(xdg)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(home, ".cache"), nil
+}
+
+func RegistryCachePath(registry Registry) (string, error) {
+	normalized, err := normalizeRegistry(registry)
+	if err != nil {
+		return "", err
+	}
+
+	root, err := CacheRoot()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(root, AppName, "registries", normalized.ID, "repo"), nil
 }
 
 func configRoot() (string, error) {
@@ -65,11 +144,12 @@ func configRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	return filepath.Join(home, ".config"), nil
 }
 
 func (c *Config) Save(path string) error {
-	c.Registries = dedupePaths(c.Registries)
+	c.Registries = dedupeRegistries(normalizeRegistries(c.Registries))
 	c.Harnesses = dedupePaths(c.Harnesses)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -86,17 +166,72 @@ func (c *Config) Save(path string) error {
 	return encoder.Encode(c)
 }
 
-func (c *Config) AddRegistry(path string) error {
-	normalized, err := ExpandPath(path)
+func (c *Config) AddRegistry(input string) error {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return errors.New("path is empty")
+	}
+
+	sourceCandidate, ref := splitGitRef(trimmed)
+	if IsGitSource(sourceCandidate) {
+		return c.AddGitRegistry(sourceCandidate, ref)
+	}
+
+	return c.AddLocalRegistry(trimmed)
+}
+
+func (c *Config) AddLocalRegistry(path string) error {
+	expanded, err := ExpandPath(path)
 	if err != nil {
 		return err
 	}
-	c.Registries = appendUniquePath(c.Registries, normalized)
+
+	registry, err := normalizeRegistry(Registry{
+		Type:   RegistryTypeLocal,
+		Source: expanded,
+	})
+	if err != nil {
+		return err
+	}
+
+	c.Registries = appendUniqueRegistry(c.Registries, registry)
 	return nil
 }
 
-func (c *Config) RemoveRegistry(path string) {
-	c.Registries = removePath(c.Registries, path)
+func (c *Config) AddGitRegistry(source, ref string) error {
+	trimmedSource := strings.TrimSpace(source)
+	if !IsGitSource(trimmedSource) {
+		return errors.New("invalid git registry source")
+	}
+
+	registry, err := normalizeRegistry(Registry{
+		Type:   RegistryTypeGit,
+		Source: trimmedSource,
+		Ref:    strings.TrimSpace(ref),
+	})
+	if err != nil {
+		return err
+	}
+
+	c.Registries = appendUniqueRegistry(c.Registries, registry)
+	return nil
+}
+
+func (c *Config) RemoveRegistry(identifier string) {
+	trimmed := strings.TrimSpace(identifier)
+	if trimmed == "" {
+		return
+	}
+
+	out := make([]Registry, 0, len(c.Registries))
+	for _, registry := range c.Registries {
+		if registry.ID == trimmed || registry.Source == trimmed {
+			continue
+		}
+		out = append(out, registry)
+	}
+
+	c.Registries = out
 }
 
 func (c *Config) AddHarness(path string) error {
@@ -184,6 +319,190 @@ func ExpandPath(path string) (string, error) {
 	}
 
 	return filepath.Clean(abs), nil
+}
+
+func IsGitSource(source string) bool {
+	trimmed := strings.TrimSpace(source)
+	if trimmed == "" {
+		return false
+	}
+
+	if strings.HasPrefix(trimmed, "git@") || strings.HasPrefix(trimmed, "ssh://") || strings.HasPrefix(trimmed, "git://") {
+		return true
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+
+	if parsed.Host == "" {
+		return false
+	}
+
+	switch parsed.Scheme {
+	case "https", "http", "ssh":
+		return parsed.Path != ""
+	default:
+		return false
+	}
+}
+
+func loadV2(configPath string) (*Config, error) {
+	decoded := &configV2{}
+	if _, err := toml.DecodeFile(configPath, decoded); err != nil {
+		return nil, err
+	}
+
+	return &Config{
+		Registries: dedupeRegistries(normalizeRegistries(decoded.Registries)),
+		Harnesses:  normalizePaths(decoded.Harnesses),
+	}, nil
+}
+
+func loadLegacyV1(configPath string) (*Config, error) {
+	decoded := &legacyConfigV1{}
+	if _, err := toml.DecodeFile(configPath, decoded); err != nil {
+		return nil, err
+	}
+
+	cfg := &Config{
+		Harnesses: normalizePaths(decoded.Harnesses),
+	}
+
+	for _, registryPath := range decoded.Registries {
+		if err := cfg.AddLocalRegistry(registryPath); err != nil {
+			continue
+		}
+	}
+
+	cfg.Registries = dedupeRegistries(cfg.Registries)
+	return cfg, nil
+}
+
+func splitGitRef(input string) (string, string) {
+	idx := strings.LastIndex(input, "#")
+	if idx <= 0 || idx >= len(input)-1 {
+		return input, ""
+	}
+
+	return strings.TrimSpace(input[:idx]), strings.TrimSpace(input[idx+1:])
+}
+
+func normalizeRegistries(registries []Registry) []Registry {
+	out := make([]Registry, 0, len(registries))
+	for _, registry := range registries {
+		normalized, err := normalizeRegistry(registry)
+		if err != nil {
+			continue
+		}
+		out = append(out, normalized)
+	}
+
+	return out
+}
+
+func normalizeRegistry(registry Registry) (Registry, error) {
+	normalized := registry
+	normalized.Name = strings.TrimSpace(normalized.Name)
+	normalized.Source = strings.TrimSpace(normalized.Source)
+	normalized.Ref = strings.TrimSpace(normalized.Ref)
+	normalized.Subdir = strings.Trim(strings.TrimSpace(normalized.Subdir), "/")
+
+	if normalized.Type == "" {
+		if IsGitSource(normalized.Source) {
+			normalized.Type = RegistryTypeGit
+		} else {
+			normalized.Type = RegistryTypeLocal
+		}
+	}
+
+	if normalized.Source == "" {
+		return Registry{}, errors.New("registry source is empty")
+	}
+
+	switch normalized.Type {
+	case RegistryTypeLocal:
+		expanded, err := ExpandPath(normalized.Source)
+		if err != nil {
+			return Registry{}, err
+		}
+		normalized.Source = expanded
+		normalized.Ref = ""
+	case RegistryTypeGit:
+		if !IsGitSource(normalized.Source) {
+			return Registry{}, errors.New("invalid git registry source")
+		}
+	default:
+		return Registry{}, errors.New("unsupported registry type")
+	}
+
+	if normalized.Subdir != "" {
+		normalized.Subdir = filepath.Clean(normalized.Subdir)
+		if normalized.Subdir == "." {
+			normalized.Subdir = ""
+		}
+	}
+
+	normalized.ID = strings.TrimSpace(normalized.ID)
+	if normalized.ID == "" {
+		normalized.ID = registryID(normalized)
+	}
+
+	return normalized, nil
+}
+
+func registryID(registry Registry) string {
+	key := string(registry.Type) + "|" + registry.Source + "|" + registry.Ref + "|" + registry.Subdir
+	sum := sha1.Sum([]byte(key))
+	encoded := hex.EncodeToString(sum[:])
+	if len(encoded) < 12 {
+		return encoded
+	}
+	return encoded[:12]
+}
+
+func appendUniqueRegistry(registries []Registry, registry Registry) []Registry {
+	for _, existing := range registries {
+		if existing.ID == registry.ID {
+			return registries
+		}
+		if existing.Type == registry.Type && existing.Source == registry.Source && existing.Ref == registry.Ref && existing.Subdir == registry.Subdir {
+			return registries
+		}
+	}
+
+	return append(registries, registry)
+}
+
+func dedupeRegistries(registries []Registry) []Registry {
+	seen := map[string]struct{}{}
+	out := make([]Registry, 0, len(registries))
+
+	for _, registry := range registries {
+		normalized, err := normalizeRegistry(registry)
+		if err != nil {
+			continue
+		}
+
+		if _, ok := seen[normalized.ID]; ok {
+			continue
+		}
+		seen[normalized.ID] = struct{}{}
+		out = append(out, normalized)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Type == out[j].Type {
+			if out[i].DisplayName() == out[j].DisplayName() {
+				return out[i].Source < out[j].Source
+			}
+			return out[i].DisplayName() < out[j].DisplayName()
+		}
+		return out[i].Type < out[j].Type
+	})
+
+	return out
 }
 
 func normalizePaths(paths []string) []string {

@@ -2,11 +2,15 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"skiller/internal/config"
 	"skiller/internal/install"
+	"skiller/internal/registrysync"
 	"skiller/internal/scan"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -63,12 +67,13 @@ type Model struct {
 
 	knownHarnesses map[string]struct{}
 
-	registries []string
+	registries []config.Registry
 	harnesses  []string
 
-	registrySkills map[string][]scan.Skill
-	harnessSkills  map[string][]scan.Skill
-	harnessRows    []harnessRow
+	registrySkills     map[string][]scan.Skill
+	registrySyncStatus map[string]string
+	harnessSkills      map[string][]scan.Skill
+	harnessRows        []harnessRow
 
 	selectedRegistry   int
 	selectedSkill      int
@@ -83,9 +88,10 @@ type Model struct {
 	confirmKind    confirmKind
 	confirmMessage string
 
-	pendingPath      string
-	pendingHarness   string
-	pendingSkillName string
+	pendingPath       string
+	pendingRegistryID string
+	pendingHarness    string
+	pendingSkillName  string
 
 	showConflict bool
 	pendingSkill scan.Skill
@@ -104,18 +110,20 @@ func NewModel() (*Model, error) {
 	input.Focus()
 	input.Prompt = ""
 	input.CharLimit = 4096
-	input.Width = 80
+	input.Width = 90
 
 	m := &Model{
-		cfg:            cfg,
-		configPath:     configPath,
-		focus:          focusRegistries,
-		registrySkills: map[string][]scan.Skill{},
-		harnessSkills:  map[string][]scan.Skill{},
-		input:          input,
+		cfg:                cfg,
+		configPath:         configPath,
+		focus:              focusRegistries,
+		registrySkills:     map[string][]scan.Skill{},
+		registrySyncStatus: map[string]string{},
+		harnessSkills:      map[string][]scan.Skill{},
+		input:              input,
 	}
 
 	m.refreshSources()
+	m.syncRemoteRegistriesOnStartup()
 	m.rescan()
 
 	return m, nil
@@ -155,7 +163,7 @@ func (m *Model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		value := strings.TrimSpace(m.input.Value())
 		if value == "" {
-			m.errorMessage = "Path cannot be empty"
+			m.errorMessage = "Path or URL cannot be empty"
 			return m, nil
 		}
 
@@ -199,7 +207,12 @@ func (m *Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		switch m.confirmKind {
 		case confirmDeleteRegistry:
-			m.cfg.RemoveRegistry(m.pendingPath)
+			registry, ok := m.registryByID(m.pendingRegistryID)
+			if ok && registry.IsRemote() {
+				_ = registrysync.RemoveRegistryCache(registry)
+			}
+
+			m.cfg.RemoveRegistry(m.pendingRegistryID)
 			if err := m.saveConfig(); err != nil {
 				m.errorMessage = err.Error()
 			} else {
@@ -281,6 +294,14 @@ func (m *Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "u":
 		m.beginUninstall()
 		return m, nil
+	case "s":
+		m.syncSelectedRegistry(true)
+		m.rescan()
+		return m, nil
+	case "S":
+		m.syncAllRemoteRegistries(true)
+		m.rescan()
+		return m, nil
 	case "r":
 		m.rescan()
 		m.statusMessage = "Rescanned sources"
@@ -350,13 +371,27 @@ func (m *Model) renderRegistriesPane(width, height int) string {
 		lines = append(lines, mutedStyle.Render("No registries. Press a to add."))
 	} else {
 		for i, registry := range m.registries {
-			line := registry
-			if i == m.selectedRegistry {
-				line = selectedStyle.Render("> " + line)
-			} else {
-				line = "  " + line
+			status := m.registrySyncStatus[registry.ID]
+			if status == "" {
+				if registry.IsRemote() {
+					status = "not synced"
+				} else {
+					status = "ready"
+				}
 			}
-			lines = append(lines, truncate(line, width-2))
+
+			label := fmt.Sprintf("[%s] %s", strings.ToUpper(string(registry.Type)), registry.DisplayName())
+			if registry.IsRemote() {
+				label = label + " {" + status + "}"
+			}
+
+			if i == m.selectedRegistry {
+				label = selectedStyle.Render("> " + label)
+			} else {
+				label = "  " + label
+			}
+
+			lines = append(lines, truncate(label, width-2))
 		}
 	}
 
@@ -367,17 +402,25 @@ func (m *Model) renderSkillsPane(width, height int) string {
 	title := paneTitleStyle(m.focus == focusSkills).Render("Registry Skills")
 	lines := []string{title}
 
-	registry := m.selectedRegistryPath()
-	if registry == "" {
+	registry, ok := m.selectedRegistryValue()
+	if !ok {
 		lines = append(lines, mutedStyle.Render("Select a registry to view skills."))
 		return paneBoxStyle(width, height, m.focus == focusSkills).Render(strings.Join(lines, "\n"))
 	}
 
-	skills := m.registrySkills[registry]
-	lines = append(lines, mutedStyle.Render(fmt.Sprintf("Source: %s", registry)))
+	source := registry.Source
+	if registry.Ref != "" {
+		source = source + "#" + registry.Ref
+	}
+	lines = append(lines, mutedStyle.Render(truncate("Source: "+source, width-2)))
 
+	skills := m.registrySkills[registry.ID]
 	if len(skills) == 0 {
-		lines = append(lines, mutedStyle.Render("No SKILL.md folders found."))
+		if registry.IsRemote() && m.registrySyncStatus[registry.ID] == "not synced" {
+			lines = append(lines, mutedStyle.Render("Remote cache missing. Press s to sync."))
+		} else {
+			lines = append(lines, mutedStyle.Render("No SKILL.md folders found."))
+		}
 	} else {
 		for i, skill := range skills {
 			line := skill.Name
@@ -423,7 +466,7 @@ func (m *Model) renderHarnessPane(width, height int) string {
 }
 
 func (m *Model) renderFooter(width int) string {
-	text := "Nav: arrows/hjkl | pane: h/l/tab | a add path | d delete path | i install | u uninstall | r rescan | q quit"
+	text := "Nav: arrows/hjkl | pane: h/l/tab | a add path/url | d delete | i install | u uninstall | s sync one | S sync all | r rescan | q quit"
 	return helpStyle.Width(width).Render(truncate(text, width))
 }
 
@@ -455,9 +498,10 @@ func (m *Model) renderOverlay(width int) string {
 func (m *Model) beginAddPath() {
 	m.errorMessage = ""
 	m.statusMessage = ""
+
 	switch m.focus {
 	case focusRegistries:
-		m.inputPrompt = "Add registry path"
+		m.inputPrompt = "Add registry path or git URL (append #ref optional)"
 		m.inputTarget = inputRegistry
 	case focusHarnesses:
 		m.inputPrompt = "Add harness path"
@@ -466,6 +510,7 @@ func (m *Model) beginAddPath() {
 		m.statusMessage = "Switch to Registries or Harness Installs pane to add paths"
 		return
 	}
+
 	m.input.SetValue("")
 	m.showInput = true
 }
@@ -476,15 +521,16 @@ func (m *Model) beginDeletePath() {
 
 	switch m.focus {
 	case focusRegistries:
-		registry := m.selectedRegistryPath()
-		if registry == "" {
+		registry, ok := m.selectedRegistryValue()
+		if !ok {
 			m.statusMessage = "No registry selected"
 			return
 		}
+
 		m.showConfirm = true
 		m.confirmKind = confirmDeleteRegistry
-		m.pendingPath = registry
-		m.confirmMessage = fmt.Sprintf("Delete registry %s?", registry)
+		m.pendingRegistryID = registry.ID
+		m.confirmMessage = fmt.Sprintf("Delete registry %s?", registry.DisplayName())
 	case focusHarnesses:
 		harness := m.selectedHarnessPath()
 		if harness == "" {
@@ -577,12 +623,90 @@ func (m *Model) installWithAction(action install.ConflictAction) {
 	m.rescan()
 }
 
+func (m *Model) syncSelectedRegistry(interactive bool) {
+	registry, ok := m.selectedRegistryValue()
+	if !ok {
+		m.statusMessage = "No registry selected"
+		return
+	}
+
+	if !registry.IsRemote() {
+		m.statusMessage = "Selected registry is local"
+		return
+	}
+
+	if m.syncRegistry(registry, interactive) {
+		m.statusMessage = fmt.Sprintf("Synced %s", registry.DisplayName())
+	}
+}
+
+func (m *Model) syncAllRemoteRegistries(interactive bool) {
+	successCount := 0
+	totalCount := 0
+
+	for _, registry := range m.registries {
+		if !registry.IsRemote() {
+			continue
+		}
+		totalCount++
+		if m.syncRegistry(registry, interactive) {
+			successCount++
+		}
+	}
+
+	if totalCount == 0 {
+		m.statusMessage = "No remote registries configured"
+		return
+	}
+
+	m.statusMessage = fmt.Sprintf("Synced %d/%d remote registries", successCount, totalCount)
+}
+
+func (m *Model) syncRemoteRegistriesOnStartup() {
+	for _, registry := range m.registries {
+		if !registry.IsRemote() {
+			continue
+		}
+		m.syncRegistry(registry, false)
+	}
+}
+
+func (m *Model) syncRegistry(registry config.Registry, interactive bool) bool {
+	timeout := 20 * time.Second
+	if interactive {
+		timeout = 4 * time.Minute
+	}
+
+	_, err := registrysync.SyncRegistry(registry, interactive, timeout)
+	if err != nil {
+		if registrysync.IsAuthError(err) {
+			m.registrySyncStatus[registry.ID] = "auth required"
+			if interactive {
+				m.errorMessage = "Authentication required. Ensure credentials are available and retry sync."
+			}
+			return false
+		}
+
+		m.registrySyncStatus[registry.ID] = "error"
+		if interactive {
+			m.errorMessage = err.Error()
+		}
+		return false
+	}
+
+	m.registrySyncStatus[registry.ID] = "synced"
+	if interactive {
+		m.errorMessage = ""
+	}
+	return true
+}
+
 func (m *Model) saveConfig() error {
 	return m.cfg.Save(m.configPath)
 }
 
 func (m *Model) refreshSources() {
-	m.registries = append([]string(nil), m.cfg.Registries...)
+	m.registries = append([]config.Registry(nil), m.cfg.Registries...)
 
 	detected := config.DetectKnownHarnesses()
 	m.harnesses = config.MergeUnique(m.cfg.Harnesses, detected)
@@ -592,7 +716,15 @@ func (m *Model) refreshSources() {
 		m.knownHarnesses[known] = struct{}{}
 	}
 
-	sort.Strings(m.registries)
+	sort.Slice(m.registries, func(i, j int) bool {
+		if m.registries[i].Type == m.registries[j].Type {
+			if m.registries[i].DisplayName() == m.registries[j].DisplayName() {
+				return m.registries[i].Source < m.registries[j].Source
+			}
+			return m.registries[i].DisplayName() < m.registries[j].DisplayName()
+		}
+		return m.registries[i].Type < m.registries[j].Type
+	})
 	sort.Strings(m.harnesses)
 
 	if m.selectedRegistry >= len(m.registries) {
@@ -605,12 +737,28 @@ func (m *Model) rescan() {
 	m.harnessSkills = map[string][]scan.Skill{}
 
 	for _, registry := range m.registries {
-		skills, err := scan.ScanRegistry(registry)
+		scanRoot, scanStatus, err := m.registryScanRoot(registry)
+		if scanStatus != "" {
+			m.registrySyncStatus[registry.ID] = scanStatus
+		}
+
 		if err != nil {
 			m.errorMessage = err.Error()
 			continue
 		}
-		m.registrySkills[registry] = skills
+
+		if scanRoot == "" {
+			m.registrySkills[registry.ID] = []scan.Skill{}
+			continue
+		}
+
+		skills, err := scan.ScanRegistry(scanRoot)
+		if err != nil {
+			m.errorMessage = err.Error()
+			continue
+		}
+
+		m.registrySkills[registry.ID] = skills
 	}
 
 	for _, harness := range m.harnesses {
@@ -624,6 +772,40 @@ func (m *Model) rescan() {
 
 	m.rebuildHarnessRows()
 	m.clampSelections()
+}
+
+func (m *Model) registryScanRoot(registry config.Registry) (string, string, error) {
+	if !registry.IsRemote() {
+		return registry.Source, "ready", nil
+	}
+
+	repoPath, err := config.RegistryCachePath(registry)
+	if err != nil {
+		return "", "error", err
+	}
+
+	root := repoPath
+	if strings.TrimSpace(registry.Subdir) != "" {
+		root = filepath.Join(root, registry.Subdir)
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", "not synced", nil
+		}
+		return "", "error", err
+	}
+
+	if !info.IsDir() {
+		return "", "error", fmt.Errorf("registry cache path is not a directory: %s", root)
+	}
+
+	if m.registrySyncStatus[registry.ID] == "" || m.registrySyncStatus[registry.ID] == "not synced" {
+		return root, "cached", nil
+	}
+
+	return root, "", nil
 }
 
 func (m *Model) rebuildHarnessRows() {
@@ -680,22 +862,31 @@ func (m *Model) moveSelection(delta int) {
 	}
 }
 
-func (m *Model) selectedRegistryPath() string {
+func (m *Model) selectedRegistryValue() (config.Registry, bool) {
 	if len(m.registries) == 0 {
-		return ""
+		return config.Registry{}, false
 	}
 	if m.selectedRegistry < 0 || m.selectedRegistry >= len(m.registries) {
-		return ""
+		return config.Registry{}, false
 	}
-	return m.registries[m.selectedRegistry]
+	return m.registries[m.selectedRegistry], true
+}
+
+func (m *Model) registryByID(id string) (config.Registry, bool) {
+	for _, registry := range m.registries {
+		if registry.ID == id {
+			return registry, true
+		}
+	}
+	return config.Registry{}, false
 }
 
 func (m *Model) skillsForSelectedRegistry() []scan.Skill {
-	registry := m.selectedRegistryPath()
-	if registry == "" {
+	registry, ok := m.selectedRegistryValue()
+	if !ok {
 		return []scan.Skill{}
 	}
-	return m.registrySkills[registry]
+	return m.registrySkills[registry.ID]
 }
 
 func (m *Model) selectedRegistrySkill() (scan.Skill, bool) {
@@ -739,6 +930,7 @@ func (m *Model) resetConfirm() {
 	m.confirmKind = confirmNone
 	m.confirmMessage = ""
 	m.pendingPath = ""
+	m.pendingRegistryID = ""
 	m.pendingSkillName = ""
 	m.pendingHarness = ""
 }

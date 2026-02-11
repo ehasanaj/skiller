@@ -7,11 +7,16 @@ It helps you discover skills, install them into harness-specific directories, an
 ## Features
 
 - Recursively scans registry directories and lists only valid skill folders (folders containing `SKILL.md`).
+- Supports registry sources from:
+  - local filesystem paths
+  - remote git repositories (GitHub/Git-compatible) via HTTPS or SSH
 - Auto-detects popular harness skill directories:
   - `~/.config/opencode/skills`
   - `~/.claude/skills`
   - `~/.agents/skills`
 - Supports adding and removing custom registries and custom harness paths.
+- Caches remote registries locally and scans the cache.
+- Runs non-interactive remote sync on startup, plus manual sync from the UI.
 - Installs a skill by copying the full folder (including hidden files) into a harness path.
 - Preserves file permissions while copying.
 - Handles install conflicts with actions: `overwrite`, `rename`, or `skip`.
@@ -23,6 +28,7 @@ It helps you discover skills, install them into harness-specific directories, an
 
 - `Skill`: any folder that contains a `SKILL.md` file.
 - `Registry`: a source directory where skills are discovered.
+  - can be a local path or a remote git repository
 - `Harness path`: a destination directory where skills are installed.
 
 ## Installation
@@ -58,16 +64,18 @@ go run ./cmd/skiller
 ## Quick Start
 
 1. Launch `skiller`.
-2. In the `Registries` pane, press `a` to add one or more registry folders.
-3. In the `Harness Installs` pane, select an auto-detected harness or add one with `a`.
-4. In `Registry Skills`, pick a skill and press `i` to install.
-5. To uninstall, select an installed skill in `Harness Installs` and press `u`.
+2. In the `Registries` pane, press `a` to add a local path or git URL.
+   - Optional branch/tag syntax: `https://github.com/org/repo.git#main`
+3. If you added a remote registry, press `s` to sync selected registry (or `S` for all remotes).
+4. In the `Harness Installs` pane, select an auto-detected harness or add one with `a`.
+5. In `Registry Skills`, pick a skill and press `i` to install.
+6. To uninstall, select an installed skill in `Harness Installs` and press `u`.
 
 ## TUI Layout
 
 `skiller` uses a fullscreen 3-pane dashboard:
 
-- `Registries` (left): configured registry paths.
+- `Registries` (left): configured local and remote registries.
 - `Registry Skills` (middle): skills found in selected registry.
 - `Harness Installs` (right): installed skills grouped by harness path.
 
@@ -82,6 +90,8 @@ The currently focused pane is visually highlighted.
 - `d`: delete selected path (confirmation required)
 - `i`: install selected skill into selected harness
 - `u`: uninstall selected installed skill (confirmation required)
+- `s`: sync selected remote registry
+- `S`: sync all remote registries
 - `r`: rescan registries and harnesses
 - `q` or `ctrl+c`: quit
 
@@ -103,15 +113,23 @@ Config is stored at:
 Example:
 
 ```toml
-registries = [
-  "/Users/alice/skills-registry",
-  "/Users/alice/team-shared-skills"
-]
+[[registries]]
+id = "a1b2c3d4e5f6"
+type = "local"
+source = "/Users/alice/skills-registry"
+
+[[registries]]
+id = "f6e5d4c3b2a1"
+type = "git"
+source = "git@github.com:acme/team-skills.git"
+ref = "main"
 
 harnesses = [
   "/Users/alice/.my-harness/skills"
 ]
 ```
+
+Legacy configs that used `registries = ["/path"]` are migrated automatically on load.
 
 Notes:
 
@@ -124,6 +142,9 @@ Notes:
 - Registry scanning is recursive.
 - Symlinked directories are not traversed during scanning.
 - Only directories containing `SKILL.md` are treated as skills.
+- Remote registries are scanned from local cache.
+- Startup sync is non-interactive (`GIT_TERMINAL_PROMPT=0`) to avoid TUI blocking.
+- Manual sync can prompt for SSH passphrase or HTTPS credentials via git.
 - Install copies the full directory tree, including dotfiles.
 - Delete/uninstall actions require explicit Y/N confirmation.
 - Uninstall only removes directories that look like valid skills (must include `SKILL.md`).
@@ -135,6 +156,7 @@ Notes:
 ```text
 cmd/skiller/            # app entrypoint
 internal/config/        # config load/save, path handling, autodetect harnesses
+internal/registrysync/  # remote git registry cache sync
 internal/scan/          # registry/harness scanning and skill discovery
 internal/fsutil/        # filesystem copy helpers
 internal/install/       # install/uninstall logic and conflict handling
